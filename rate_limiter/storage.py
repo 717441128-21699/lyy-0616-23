@@ -111,16 +111,16 @@ class InMemoryStorage(BaseStorage):
         with self._lock:
             self._cleanup_expired()
 
-            if "SLIDING_WINDOW" in script.upper() or "bucket_duration" in script:
+            if "SCRIPT_TAG: SLIDING_WINDOW_SCRIPT" in script:
                 return self._eval_sliding_window(keys, args)
 
-            if "PREFETCH" in script.upper() or "lease" in script.lower():
+            if "SCRIPT_TAG: PREFETCH_SCRIPT" in script:
                 return self._eval_prefetch(keys, args)
 
-            if "RETURN" in script.upper() and "lease" in script.lower():
+            if "SCRIPT_TAG: RETURN_LEASE_SCRIPT" in script:
                 return self._eval_return_lease(keys, args)
 
-            if "WINDOW_SYNC" in script.upper() or "sync" in script.lower():
+            if "SCRIPT_TAG: WINDOW_SYNC_SCRIPT" in script:
                 return self._eval_window_sync(keys, args)
 
             if "INCR" in script.upper() and "LIMIT" in script.upper():
@@ -253,10 +253,10 @@ class InMemoryStorage(BaseStorage):
             leases[instance_id] = json.dumps(lease)
             self._data[leases_key] = (leases, time.time() + window_ttl)
             self._data[key] = (current, time.time() + window_ttl)
-            return StorageResult(success=True, value=[granted, limit - current - allocated - granted])
+            return StorageResult(success=True, value=[granted, limit - current - allocated - granted, current])
 
         self._data[key] = (current, time.time() + window_ttl)
-        return StorageResult(success=True, value=[0, remaining])
+        return StorageResult(success=True, value=[0, remaining, current])
 
     def _eval_return_lease(self, keys: list, args: list) -> StorageResult:
         import json

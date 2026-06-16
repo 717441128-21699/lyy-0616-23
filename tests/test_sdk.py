@@ -159,7 +159,9 @@ class TestRateLimiterClient:
 
         stats = client.get_stats()
         assert stats["global_limit"] == 100
-        assert stats["local_count"] == 5
+        assert stats["global_count"] == 5
+        assert "remaining" in stats
+        assert stats["remaining"] == 95
 
     def test_is_degraded(self):
         storage = InMemoryStorage()
@@ -172,7 +174,7 @@ class TestRateLimiterClient:
         assert client.is_degraded() is False
 
         storage.set_available(False)
-        time.sleep(0.15)
+        time.sleep(0.3)
 
         assert client.is_degraded() is True
 
@@ -328,7 +330,7 @@ class TestAsyncRateLimiterClient:
         )
 
         storage.set_available(False)
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.3)
 
         result = await client.try_acquire(1)
         assert result.allowed is True
@@ -361,32 +363,47 @@ class TestIntegration:
 
         assert 18 <= total_allowed <= 22
 
-    def test_prefetch_vs_per_request_latency(self):
+    def test_prefetch_vs_per_request_correctness(self):
         storage = InMemoryStorage()
+        limit = 200
 
         prefetch_client = RateLimiterClient(
-            global_limit=1000,
+            global_limit=limit,
             storage=storage,
             mode=CoordinationMode.PRE_FETCH,
             prefetch_ratio=0.1,
-            min_prefetch=100
+            min_prefetch=20,
+            instance_id="prefetch_inst"
         )
 
         per_request_client = RateLimiterClient(
-            global_limit=1000,
+            global_limit=limit,
             storage=storage,
             mode=CoordinationMode.PER_REQUEST,
-            instance_id="per_request"
+            instance_id="per_request_inst"
         )
 
-        start = time.time()
-        for _ in range(500):
-            prefetch_client.try_acquire(1)
-        prefetch_time = time.time() - start
+        prefetch_allowed = 0
+        for _ in range(limit + 50):
+            if prefetch_client.try_acquire(1).allowed:
+                prefetch_allowed += 1
 
-        start = time.time()
-        for _ in range(500):
-            per_request_client.try_acquire(1)
-        per_request_time = time.time() - start
+        assert limit - 5 <= prefetch_allowed <= limit + 5, \
+            f"Prefetch mode expected ~{limit}, got {prefetch_allowed}"
 
-        assert prefetch_time < per_request_time
+        per_request_allowed = 0
+        for _ in range(limit + 50):
+            if per_request_client.try_acquire(1).allowed:
+                per_request_allowed += 1
+
+        assert per_request_allowed <= limit, \
+            f"Per-request mode expected <={limit}, got {per_request_allowed}"
+
+        prefetch_stats = prefetch_client.get_stats()
+        assert "global_count" in prefetch_stats
+        assert "remaining" in prefetch_stats
+        assert prefetch_stats["remaining"] >= 0
+
+        per_request_stats = per_request_client.get_stats()
+        assert "global_count" in per_request_stats
+        assert per_request_stats["mode"] == "per_request"

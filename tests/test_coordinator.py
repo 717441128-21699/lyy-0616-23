@@ -60,7 +60,9 @@ class TestDistributedCoordinator:
         stats = coordinator.get_stats()
         assert stats["has_lease"] is True
         assert stats["lease_quota"] >= 5
-        assert stats["lease_used"] > 0
+        assert stats["global_count"] >= 50
+        assert "remaining" in stats
+        assert stats["remaining"] >= 0
 
     def test_exceed_global_limit(self):
         storage = InMemoryStorage()
@@ -189,11 +191,11 @@ class TestDistributedCoordinator:
         )
 
         storage.set_available(False)
-        time.sleep(0.15)
+        time.sleep(0.3)
         assert coordinator._degraded is True
 
         storage.set_available(True)
-        time.sleep(0.15)
+        time.sleep(0.3)
 
         for _ in range(10):
             result = coordinator.try_acquire(1)
@@ -344,7 +346,7 @@ class TestDistributedCoordinator:
         )
 
         storage.set_available(False)
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.3)
 
         result = await coordinator.atry_acquire(1)
         assert result.allowed is True

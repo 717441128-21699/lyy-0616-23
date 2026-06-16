@@ -125,9 +125,10 @@ class SlidingWindow:
         time_to_next_slot = (oldest_bucket_key + 1) * self.bucket_duration - now
         return int(total), max(0.001, time_to_next_slot)
 
-    def try_acquire(self, count: int = 1) -> RateLimitResult:
-        with self._lock:
+    def try_acquire(self, count: int = 1, now: float = None) -> RateLimitResult:
+        if now is None:
             now = time.time()
+        with self._lock:
             self._cleanup_old_buckets(now)
 
             current_count, time_to_next = self._get_window_count(now)
@@ -148,6 +149,14 @@ class SlidingWindow:
                     limit=self.limit,
                     retry_after=time_to_next
                 )
+
+    def rollback_last(self, count: int = 1, now: float = None) -> None:
+        if now is None:
+            now = time.time()
+        with self._lock:
+            bucket_key = self._get_bucket_key(now)
+            if bucket_key in self.buckets:
+                self.buckets[bucket_key] = max(0, self.buckets[bucket_key] - count)
 
     def get_current_count(self) -> int:
         with self._lock:

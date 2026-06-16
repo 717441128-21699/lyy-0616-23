@@ -41,6 +41,7 @@ class WindowState:
 
 class DistributedCoordinator:
     PREFETCH_SCRIPT = """
+    -- SCRIPT_TAG: PREFETCH_SCRIPT
     local key = KEYS[1]
     local leases_key = KEYS[2]
     local limit = tonumber(ARGV[1])
@@ -96,15 +97,16 @@ class DistributedCoordinator:
         redis.call('SET', key, current)
         redis.call('EXPIRE', key, window_ttl)
 
-        return {granted, limit - current - allocated - granted}
+        return {granted, limit - current - allocated - granted, current}
     end
 
     redis.call('SET', key, current)
     redis.call('EXPIRE', key, window_ttl)
-    return {0, remaining}
+    return {0, remaining, current}
     """
 
     RETURN_LEASE_SCRIPT = """
+    -- SCRIPT_TAG: RETURN_LEASE_SCRIPT
     local leases_key = KEYS[1]
     local instance_id = ARGV[1]
     local used = tonumber(ARGV[2])
@@ -125,6 +127,7 @@ class DistributedCoordinator:
     """
 
     WINDOW_SYNC_SCRIPT = """
+    -- SCRIPT_TAG: WINDOW_SYNC_SCRIPT
     local key = KEYS[1]
     local leases_key = KEYS[2]
     local limit = tonumber(ARGV[1])
@@ -160,6 +163,7 @@ class DistributedCoordinator:
     """
 
     SLIDING_WINDOW_SCRIPT = """
+    -- SCRIPT_TAG: SLIDING_WINDOW_SCRIPT
     local hash_key = KEYS[1]
     local limit = tonumber(ARGV[1])
     local window_size = tonumber(ARGV[2])
@@ -321,7 +325,7 @@ class DistributedCoordinator:
             )
             self._current_lease = None
             self._local_bucket = TokenBucket(
-                rate=self.global_limit,
+                rate=0,
                 capacity=self.global_limit,
                 initial_tokens=0
             )
@@ -349,14 +353,12 @@ class DistributedCoordinator:
                 pass
 
     def _prefetch_quota(self, now: float) -> Tuple[int, int]:
+        self._force_sync(now)
+
         window_start = self._get_window_start(now)
         key = self._get_counter_key(window_start)
         leases_key = self._get_leases_key(window_start)
         request_amount = self._calculate_prefetch_amount()
-
-        old_used = 0
-        if self._current_lease is not None:
-            old_used = self._current_lease.used
 
         result = self.storage.eval(
             self.PREFETCH_SCRIPT,
@@ -368,16 +370,22 @@ class DistributedCoordinator:
                 str(int(self.lease_ttl)),
                 str(int(self.window_size * 2)),
                 str(int(now)),
-                str(old_used)
+                "0"
             ]
         )
 
         if not result.success or result.value is None:
             raise StorageUnavailableError("Failed to prefetch quota")
 
-        granted, remaining = result.value
-        granted = int(granted)
-        remaining = int(remaining)
+        granted = int(result.value[0])
+        remaining = int(result.value[1])
+        global_count = int(result.value[2]) if len(result.value) > 2 else 0
+
+        self._window_state.global_count = global_count
+        if granted > 0:
+            self._window_state.local_count = 0
+            if self._current_lease is not None:
+                self._current_lease.used = 0
 
         if granted > 0:
             self._current_lease = PrefetchLease(
@@ -392,14 +400,15 @@ class DistributedCoordinator:
         return granted, remaining
 
     async def _aprefetch_quota(self, now: float) -> Tuple[int, int]:
+        try:
+            self._force_sync(now)
+        except Exception:
+            pass
+
         window_start = self._get_window_start(now)
         key = self._get_counter_key(window_start)
         leases_key = self._get_leases_key(window_start)
         request_amount = self._calculate_prefetch_amount()
-
-        old_used = 0
-        if self._current_lease is not None:
-            old_used = self._current_lease.used
 
         result = await self.storage.aeval(
             self.PREFETCH_SCRIPT,
@@ -411,16 +420,22 @@ class DistributedCoordinator:
                 str(int(self.lease_ttl)),
                 str(int(self.window_size * 2)),
                 str(int(now)),
-                str(old_used)
+                "0"
             ]
         )
 
         if not result.success or result.value is None:
             raise StorageUnavailableError("Failed to prefetch quota")
 
-        granted, remaining = result.value
-        granted = int(granted)
-        remaining = int(remaining)
+        granted = int(result.value[0])
+        remaining = int(result.value[1])
+        global_count = int(result.value[2]) if len(result.value) > 2 else 0
+
+        self._window_state.global_count = global_count
+        if granted > 0:
+            self._window_state.local_count = 0
+            if self._current_lease is not None:
+                self._current_lease.used = 0
 
         if granted > 0:
             self._current_lease = PrefetchLease(
@@ -497,6 +512,10 @@ class DistributedCoordinator:
             if result.success and result.value:
                 global_count, available = result.value
                 self._window_state.global_count = int(global_count)
+                if self._current_lease is not None:
+                    self._current_lease.used = max(
+                        0, self._current_lease.used - self._window_state.local_count
+                    )
                 self._window_state.local_count = 0
                 self._window_state.last_sync_time = now
         except Exception:
@@ -527,6 +546,10 @@ class DistributedCoordinator:
             if result.success and result.value:
                 global_count, available = result.value
                 self._window_state.global_count = int(global_count)
+                if self._current_lease is not None:
+                    self._current_lease.used = max(
+                        0, self._current_lease.used - self._window_state.local_count
+                    )
                 self._window_state.local_count = 0
                 self._window_state.last_sync_time = now
         except Exception:
@@ -641,6 +664,16 @@ class DistributedCoordinator:
             except StorageUnavailableError:
                 raise
 
+        window_result = self._window_counter.try_acquire(tokens, now)
+        if not window_result.allowed:
+            retry_after = max(0.001, window_result.retry_after)
+            return RateLimitResult(
+                allowed=False,
+                remaining=0,
+                limit=self.global_limit,
+                retry_after=retry_after
+            )
+
         local_result = self._local_bucket.try_consume(tokens)
 
         if local_result.allowed:
@@ -655,10 +688,20 @@ class DistributedCoordinator:
                 retry_after=0.0
             )
         else:
+            self._window_counter.rollback_last(tokens)
             if self._local_bucket.peek() == 0:
                 try:
                     granted, remaining_global = self._prefetch_quota(now)
                     if granted > 0:
+                        window_result2 = self._window_counter.try_acquire(tokens, now)
+                        if not window_result2.allowed:
+                            retry_after = max(0.001, window_result2.retry_after)
+                            return RateLimitResult(
+                                allowed=False,
+                                remaining=0,
+                                limit=self.global_limit,
+                                retry_after=retry_after
+                            )
                         local_result = self._local_bucket.try_consume(tokens)
                         if local_result.allowed:
                             if self._current_lease:
@@ -671,6 +714,8 @@ class DistributedCoordinator:
                                 limit=self.global_limit,
                                 retry_after=0.0
                             )
+                        else:
+                            self._window_counter.rollback_last(tokens)
                 except StorageUnavailableError:
                     raise
 
@@ -701,6 +746,16 @@ class DistributedCoordinator:
             except StorageUnavailableError:
                 raise
 
+        window_result = self._window_counter.try_acquire(tokens, now)
+        if not window_result.allowed:
+            retry_after = max(0.001, window_result.retry_after)
+            return RateLimitResult(
+                allowed=False,
+                remaining=0,
+                limit=self.global_limit,
+                retry_after=retry_after
+            )
+
         local_result = self._local_bucket.try_consume(tokens)
 
         if local_result.allowed:
@@ -715,10 +770,20 @@ class DistributedCoordinator:
                 retry_after=0.0
             )
         else:
+            self._window_counter.rollback_last(tokens)
             if self._local_bucket.peek() == 0:
                 try:
                     granted, remaining_global = await self._aprefetch_quota(now)
                     if granted > 0:
+                        window_result2 = self._window_counter.try_acquire(tokens, now)
+                        if not window_result2.allowed:
+                            retry_after = max(0.001, window_result2.retry_after)
+                            return RateLimitResult(
+                                allowed=False,
+                                remaining=0,
+                                limit=self.global_limit,
+                                retry_after=retry_after
+                            )
                         local_result = self._local_bucket.try_consume(tokens)
                         if local_result.allowed:
                             if self._current_lease:
@@ -731,6 +796,8 @@ class DistributedCoordinator:
                                 limit=self.global_limit,
                                 retry_after=0.0
                             )
+                        else:
+                            self._window_counter.rollback_last(tokens)
                 except StorageUnavailableError:
                     raise
 
@@ -877,8 +944,56 @@ class DistributedCoordinator:
         self._sync_thread = threading.Thread(target=sync_loop, daemon=True)
         self._sync_thread.start()
 
+    def _force_sync(self, now: float) -> None:
+        if self._degraded or self._window_state.local_count == 0:
+            return
+
+        window_start = self._get_window_start(now)
+        key = self._get_counter_key(window_start)
+        leases_key = self._get_leases_key(window_start)
+
+        try:
+            result = self.storage.eval(
+                self.WINDOW_SYNC_SCRIPT,
+                [key, leases_key],
+                [
+                    str(self.global_limit),
+                    str(int(self.window_size * 2)),
+                    str(self._window_state.local_count),
+                    str(int(now))
+                ]
+            )
+            if result.success and result.value:
+                global_count, _ = result.value
+                self._window_state.global_count = int(global_count)
+                if self._current_lease is not None:
+                    self._current_lease.used = max(
+                        0, self._current_lease.used - self._window_state.local_count
+                    )
+                self._window_state.local_count = 0
+                self._window_state.last_sync_time = now
+        except Exception:
+            pass
+
     def get_stats(self) -> Dict:
         with self._lock:
+            now = time.time()
+            try:
+                self._force_sync(now)
+            except Exception:
+                pass
+
+            actual_global_used = self._window_state.global_count + self._window_state.local_count
+            lease_used = self._current_lease.used if self._current_lease else 0
+            lease_quota = self._current_lease.quota if self._current_lease else 0
+
+            if self.mode == CoordinationMode.PRE_FETCH:
+                effective_used = actual_global_used
+                remaining = max(0, self.global_limit - effective_used)
+            else:
+                effective_used = actual_global_used
+                remaining = max(0, self.global_limit - effective_used)
+
             return {
                 "instance_id": self.instance_id,
                 "global_limit": self.global_limit,
@@ -887,12 +1002,13 @@ class DistributedCoordinator:
                 "degraded": self._degraded,
                 "degradation_mode": self.degradation_mode.value,
                 "current_window_start": self._window_state.window_start,
-                "global_count": self._window_state.global_count,
-                "local_count": self._window_state.local_count,
+                "global_count": effective_used,
+                "local_count": lease_used,
                 "local_tokens": self._local_bucket.peek(),
                 "has_lease": self._current_lease is not None,
-                "lease_used": self._current_lease.used if self._current_lease else 0,
-                "lease_quota": self._current_lease.quota if self._current_lease else 0
+                "lease_used": lease_used,
+                "lease_quota": lease_quota,
+                "remaining": remaining
             }
 
     def close(self) -> None:
