@@ -388,8 +388,8 @@ class TestIntegration:
             if prefetch_client.try_acquire(1).allowed:
                 prefetch_allowed += 1
 
-        assert limit - 5 <= prefetch_allowed <= limit + 5, \
-            f"Prefetch mode expected ~{limit}, got {prefetch_allowed}"
+        assert limit - 2 <= prefetch_allowed <= limit, \
+            f"Prefetch mode expected <={limit}, got {prefetch_allowed}"
 
         per_request_allowed = 0
         for _ in range(limit + 50):
@@ -407,3 +407,75 @@ class TestIntegration:
         per_request_stats = per_request_client.get_stats()
         assert "global_count" in per_request_stats
         assert per_request_stats["mode"] == "per_request"
+
+    def test_sync_async_get_stats_consistency(self):
+        import asyncio
+        from rate_limiter import create_rate_limiter, create_async_rate_limiter
+
+        limit = 20
+        storage_sync = InMemoryStorage()
+        storage_async = InMemoryStorage()
+
+        sync_client = create_rate_limiter(
+            limit=limit,
+            storage=storage_sync,
+            mode=CoordinationMode.PRE_FETCH,
+            min_prefetch=5,
+            max_prefetch=10,
+            instance_id="sync_client"
+        )
+
+        async def run_async_test():
+            async_client = create_async_rate_limiter(
+                limit=limit,
+                storage=storage_async,
+                mode=CoordinationMode.PRE_FETCH,
+                min_prefetch=5,
+                max_prefetch=10,
+                instance_id="async_client"
+            )
+
+            sync_passed = 0
+            for _ in range(30):
+                if sync_client.try_acquire(1).allowed:
+                    sync_passed += 1
+
+            async_passed = 0
+            for _ in range(30):
+                if (await async_client.try_acquire(1)).allowed:
+                    async_passed += 1
+
+            sync_stats_1 = sync_client.get_stats(force_sync=False)
+            sync_stats_2 = sync_client.get_stats(force_sync=True)
+            async_stats_1 = async_client.get_stats(force_sync=False)
+            async_stats_2 = async_client.get_stats(force_sync=True)
+
+            assert sync_stats_1["local_used_total"] == sync_passed
+            assert sync_stats_2["local_used_total"] == sync_passed
+            assert async_stats_1["local_used_total"] == async_passed
+            assert async_stats_2["local_used_total"] == async_passed
+
+            assert sync_stats_2["pending_sync"] == 0
+            assert async_stats_2["pending_sync"] == 0
+
+            expected_remaining_sync = max(0, limit - sync_passed)
+            expected_remaining_async = max(0, limit - async_passed)
+            assert sync_stats_1["remaining"] == expected_remaining_sync
+            assert sync_stats_2["remaining"] == expected_remaining_sync
+            assert async_stats_1["remaining"] == expected_remaining_async
+            assert async_stats_2["remaining"] == expected_remaining_async
+
+            assert "local_used_total" in sync_stats_1
+            assert "synced_to_center" in sync_stats_1
+            assert "pending_sync" in sync_stats_1
+            assert "remaining" in sync_stats_1
+
+            assert "local_used_total" in async_stats_1
+            assert "synced_to_center" in async_stats_1
+            assert "pending_sync" in async_stats_1
+            assert "remaining" in async_stats_1
+
+            sync_client.close()
+            await async_client.close()
+
+        asyncio.run(run_async_test())

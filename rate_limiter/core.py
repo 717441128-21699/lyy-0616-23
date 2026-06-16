@@ -169,3 +169,9 @@ class SlidingWindow:
         with self._lock:
             self.buckets.clear()
             self._initialize_buckets()
+
+    def set_limit(self, new_limit: int) -> None:
+        with self._lock:
+            if new_limit <= 0:
+                raise ValueError("Limit must be positive")
+            self.limit = new_limit

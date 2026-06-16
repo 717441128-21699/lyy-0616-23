@@ -244,17 +244,32 @@ class InMemoryStorage(BaseStorage):
         sliding_used = prev_used * prev_window_weight + current
 
         allocated = 0
+        total_allocated = 0
         for inst_id, lease_json in leases.items():
             try:
                 lease = json.loads(lease_json)
-                if inst_id != instance_id and lease['expires_at'] > now:
-                    allocated += (lease['quota'] - lease['used'])
+                if lease['expires_at'] > now:
+                    if inst_id != instance_id:
+                        allocated += (lease['quota'] - lease['used'])
+                        total_allocated += lease['quota']
             except (json.JSONDecodeError, KeyError):
                 pass
 
         effective_used = sliding_used + allocated
         remaining = max(0, limit - effective_used)
         granted = min(request_amount, int(remaining))
+
+        # 硬约束1：已使用 + 新分配不能超过 limit
+        if current + granted > limit:
+            granted = limit - current
+            if granted < 0:
+                granted = 0
+
+        # 硬约束2：所有实例的租约配额总和 + 新分配 <= limit（从根本上防止多实例叠加超限）
+        if total_allocated + granted > limit:
+            granted = limit - total_allocated
+            if granted < 0:
+                granted = 0
 
         if granted > 0:
             lease = {

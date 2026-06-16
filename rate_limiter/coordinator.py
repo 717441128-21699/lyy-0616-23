@@ -87,12 +87,16 @@ class DistributedCoordinator:
     local sliding_used = prev_used * prev_window_weight + current
 
     local allocated = 0
+    local total_allocated = 0
     local leases = redis.call('HGETALL', leases_key)
     for i = 1, #leases, 2 do
         local lid = leases[i]
         local lease_data = cjson.decode(leases[i + 1])
-        if lid ~= instance_id and lease_data.expires_at > now then
-            allocated = allocated + (lease_data.quota - lease_data.used)
+        if lease_data.expires_at > now then
+            if lid ~= instance_id then
+                allocated = allocated + (lease_data.quota - lease_data.used)
+                total_allocated = total_allocated + lease_data.quota
+            end
         end
     end
 
@@ -103,6 +107,22 @@ class DistributedCoordinator:
     end
 
     local granted = math.min(request_amount, math.floor(remaining))
+
+    -- 硬约束1：已使用 + 新分配不能超过 limit
+    if current + granted > limit then
+        granted = limit - current
+        if granted < 0 then
+            granted = 0
+        end
+    end
+
+    -- 硬约束2：所有实例的租约配额总和 + 新分配 <= limit（从根本上防止多实例叠加超限）
+    if total_allocated + granted > limit then
+        granted = limit - total_allocated
+        if granted < 0 then
+            granted = 0
+        end
+    end
 
     if granted > 0 then
         local lease = {
@@ -436,6 +456,8 @@ class DistributedCoordinator:
                 acquired_at=now
             )
             self._local_bucket.add_tokens(granted)
+            self._window_counter.set_limit(granted)
+            self._window_counter.reset()
 
         return granted, remaining
 
@@ -487,6 +509,8 @@ class DistributedCoordinator:
                 acquired_at=now
             )
             self._local_bucket.add_tokens(granted)
+            self._window_counter.set_limit(granted)
+            self._window_counter.reset()
 
         return granted, remaining
 
@@ -1026,12 +1050,9 @@ class DistributedCoordinator:
             pending_sync = self._window_state.local_count
             local_used_total = synced_to_center + pending_sync
 
-            if self.mode == CoordinationMode.PRE_FETCH:
-                global_used = self._window_state.global_count
-            else:
-                global_used = self._window_state.global_count
+            global_used = self._window_state.global_count
 
-            remaining = max(0, self.global_limit - global_used)
+            remaining = max(0, self.global_limit - max(global_used, local_used_total))
 
             return {
                 "instance_id": self.instance_id,

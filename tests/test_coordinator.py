@@ -391,8 +391,8 @@ class TestDistributedCoordinator:
             global_limit=limit,
             window_size=1.0,
             mode=CoordinationMode.PRE_FETCH,
-            min_prefetch=3,
-            max_prefetch=5,
+            min_prefetch=1,
+            max_prefetch=2,
             instance_id="instance_a"
         )
 
@@ -401,8 +401,8 @@ class TestDistributedCoordinator:
             global_limit=limit,
             window_size=1.0,
             mode=CoordinationMode.PRE_FETCH,
-            min_prefetch=3,
-            max_prefetch=5,
+            min_prefetch=1,
+            max_prefetch=2,
             instance_id="instance_b"
         )
 
@@ -430,8 +430,8 @@ class TestDistributedCoordinator:
         all_events = sorted(timeline_a + timeline_b)
         total = len(all_events)
 
-        assert total >= limit and total <= limit * 2 + 2, \
-            f"Total {total} not in [{limit}, {limit * 2 + 2}]"
+        assert total >= limit and total <= limit * 2, \
+            f"Total {total} not in [{limit}, {limit * 2}]"
 
         window_log = []
         max_in_window = 0
@@ -442,13 +442,13 @@ class TestDistributedCoordinator:
             window_log.append(t)
             max_in_window = max(max_in_window, len(window_log))
 
-        assert max_in_window <= limit + 1, \
-            f"Max in 1s window {max_in_window} > {limit + 1}"
+        assert max_in_window <= limit, \
+            f"Max in 1s window {max_in_window} > {limit}"
 
         test_duration = 2.0
         rate = total / test_duration
-        assert rate <= limit * 1.25, \
-            f"Rate {rate:.1f}/s > {limit * 1.25:.1f}/s"
+        assert rate <= limit + 0.5, \
+            f"Rate {rate:.1f}/s > {limit + 0.5:.1f}/s"
 
     def test_prefetch_stats_hierarchy(self):
         storage = InMemoryStorage()
@@ -478,12 +478,16 @@ class TestDistributedCoordinator:
             f"local_used_total={s1['local_used_total']} != {actual_passed}"
         assert s1["pending_sync"] + s1["synced_to_center"] == actual_passed, \
             f"pending + synced != actual"
-        assert "remaining" in s1
-        assert s1["remaining"] >= 0
+
+        expected_remaining_s1 = max(0, limit - actual_passed)
+        assert s1["remaining"] == expected_remaining_s1, \
+            f"remaining before sync: {s1['remaining']} != {expected_remaining_s1}"
 
         for _ in range(3):
             s = coord.get_stats(force_sync=False)
             assert s["local_used_total"] == actual_passed
+            assert s["remaining"] == expected_remaining_s1, \
+                f"remaining drifted: {s['remaining']} != {expected_remaining_s1}"
 
         s2 = coord.get_stats(force_sync=True)
         assert s2["pending_sync"] == 0, \
@@ -492,7 +496,10 @@ class TestDistributedCoordinator:
             f"local_used_total should not reset after sync"
         assert s2["synced_to_center"] == actual_passed, \
             f"synced_to_center={s2['synced_to_center']} != {actual_passed}"
-        assert s2["remaining"] == max(0, limit - s2["global_count"])
+
+        expected_remaining_s2 = max(0, limit - max(s2["global_count"], actual_passed))
+        assert s2["remaining"] == expected_remaining_s2, \
+            f"remaining after sync: {s2['remaining']} != {expected_remaining_s2}"
 
     def test_prefetch_sliding_window_boundary(self):
         storage = InMemoryStorage()
@@ -536,8 +543,8 @@ class TestDistributedCoordinator:
             window_log.append(t)
             max_in_window = max(max_in_window, len(window_log))
 
-        assert max_in_window <= limit + 1, \
-            f"Sliding window burst {max_in_window} > {limit + 1}"
+        assert max_in_window <= limit, \
+            f"Sliding window burst {max_in_window} > {limit}"
 
     @pytest.mark.asyncio
     async def test_async_prefetch_mode(self):
@@ -560,7 +567,7 @@ class TestDistributedCoordinator:
             if result.allowed:
                 passed += 1
 
-        assert passed <= limit + 1, f"Async passed {passed} > {limit + 1}"
+        assert passed <= limit, f"Async passed {passed} > {limit}"
 
         stats = coord.get_stats()
         assert stats["local_used_total"] == passed
@@ -577,8 +584,8 @@ class TestDistributedCoordinator:
             global_limit=limit,
             window_size=1.0,
             mode=CoordinationMode.PRE_FETCH,
-            min_prefetch=3,
-            max_prefetch=5,
+            min_prefetch=1,
+            max_prefetch=2,
             instance_id="async_a"
         )
 
@@ -587,21 +594,40 @@ class TestDistributedCoordinator:
             global_limit=limit,
             window_size=1.0,
             mode=CoordinationMode.PRE_FETCH,
-            min_prefetch=3,
-            max_prefetch=5,
+            min_prefetch=1,
+            max_prefetch=2,
             instance_id="async_b"
         )
 
-        passed_a = 0
-        passed_b = 0
+        timeline_a = []
+        timeline_b = []
+        start = time.time()
 
-        for _ in range(20):
+        while time.time() - start < 2.0:
             if (await coord_a.atry_acquire(1)).allowed:
-                passed_a += 1
+                timeline_a.append(time.time())
             if (await coord_b.atry_acquire(1)).allowed:
-                passed_b += 1
+                timeline_b.append(time.time())
+            await asyncio.sleep(0.005)
 
-        total = passed_a + passed_b
-        assert total <= limit * 2, f"Total {total} > {limit * 2}"
-        assert total <= limit + 2 or total <= limit * 1.5, \
-            f"Total {total} too high for limit {limit}"
+        all_events = sorted(timeline_a + timeline_b)
+        total = len(all_events)
+
+        assert total >= limit and total <= limit * 2, \
+            f"Total {total} not in [{limit}, {limit * 2}]"
+
+        window_log = []
+        max_in_window = 0
+        for t in all_events:
+            cutoff = t - 1.0
+            while window_log and window_log[0] < cutoff:
+                window_log.pop(0)
+            window_log.append(t)
+            max_in_window = max(max_in_window, len(window_log))
+
+        assert max_in_window <= limit, \
+            f"Max in 1s window {max_in_window} > {limit}"
+
+        rate = total / 2.0
+        assert rate <= limit + 0.5, \
+            f"Rate {rate:.1f}/s > {limit + 0.5:.1f}/s"
