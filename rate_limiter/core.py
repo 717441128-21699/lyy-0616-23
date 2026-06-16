@@ -43,7 +43,10 @@ class TokenBucket:
                 )
             else:
                 needed = tokens - self.tokens
-                retry_after = needed / self.rate
+                if self.rate > 0:
+                    retry_after = needed / self.rate
+                else:
+                    retry_after = float('inf')
                 return RateLimitResult(
                     allowed=False,
                     remaining=int(self.tokens),

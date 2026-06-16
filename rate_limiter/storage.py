@@ -110,6 +110,19 @@ class InMemoryStorage(BaseStorage):
             raise StorageUnavailableError("In-memory storage is unavailable")
         with self._lock:
             self._cleanup_expired()
+
+            if "SLIDING_WINDOW" in script.upper() or "bucket_duration" in script:
+                return self._eval_sliding_window(keys, args)
+
+            if "PREFETCH" in script.upper() or "lease" in script.lower():
+                return self._eval_prefetch(keys, args)
+
+            if "RETURN" in script.upper() and "lease" in script.lower():
+                return self._eval_return_lease(keys, args)
+
+            if "WINDOW_SYNC" in script.upper() or "sync" in script.lower():
+                return self._eval_window_sync(keys, args)
+
             if "INCR" in script.upper() and "LIMIT" in script.upper():
                 key = keys[0]
                 limit = int(args[0])
@@ -124,7 +137,188 @@ class InMemoryStorage(BaseStorage):
                     return StorageResult(success=True, value=[1, limit - new_value])
                 else:
                     return StorageResult(success=True, value=[0, limit - current])
+
             return StorageResult(success=True, value=None)
+
+    def _eval_sliding_window(self, keys: list, args: list) -> StorageResult:
+        import math
+
+        hash_key = keys[0]
+        limit = float(args[0])
+        window_size = float(args[1])
+        bucket_count = int(args[2])
+        amount = float(args[3])
+        now = float(args[4])
+
+        bucket_duration = window_size / bucket_count
+        window_start = now - window_size
+        current_bucket = math.floor(now / bucket_duration)
+
+        buckets, expire_at = self._data.get(hash_key, ({}, None))
+        if expire_at is not None and time.time() >= expire_at:
+            buckets = {}
+
+        total = 0.0
+        oldest_bucket_key = None
+        oldest_count = 0
+        expired_keys = []
+
+        for bucket_key_str, count in buckets.items():
+            bucket_key = int(bucket_key_str)
+            bucket_start = bucket_key * bucket_duration
+
+            if bucket_start >= window_start:
+                if oldest_bucket_key is None or bucket_key < oldest_bucket_key:
+                    oldest_bucket_key = bucket_key
+                    oldest_count = count
+                total += count
+            else:
+                expired_keys.append(bucket_key_str)
+
+        for k in expired_keys:
+            del buckets[k]
+
+        if oldest_bucket_key is not None and oldest_bucket_key != current_bucket:
+            overlap = (oldest_bucket_key + 1) * bucket_duration - window_start
+            weight = overlap / bucket_duration
+            total = total - oldest_count + oldest_count * weight
+
+        if total + amount <= limit:
+            current_bucket_str = str(current_bucket)
+            buckets[current_bucket_str] = buckets.get(current_bucket_str, 0) + amount
+            ttl = window_size * 2
+            self._data[hash_key] = (buckets, time.time() + ttl)
+
+            new_remaining = limit - (total + amount)
+            return StorageResult(success=True, value=[1, int(new_remaining), 0.0])
+        else:
+            time_to_next_bucket = (current_bucket + 1) * bucket_duration - now
+            retry_after = time_to_next_bucket
+            if retry_after <= 0:
+                retry_after = 0.001
+            return StorageResult(success=True, value=[0, 0, retry_after])
+
+    def _eval_prefetch(self, keys: list, args: list) -> StorageResult:
+        import json
+
+        key = keys[0]
+        leases_key = keys[1]
+        limit = int(args[0])
+        request_amount = int(args[1])
+        instance_id = args[2]
+        lease_ttl = float(args[3])
+        window_ttl = float(args[4])
+        now = float(args[5])
+        old_used = int(args[6]) if len(args) > 6 else 0
+
+        current, _ = self._data.get(key, (0, None))
+        if not isinstance(current, int):
+            current = 0
+
+        leases, _ = self._data.get(leases_key, ({}, None))
+        if not isinstance(leases, dict):
+            leases = {}
+
+        old_lease_json = leases.get(instance_id)
+        if old_lease_json is not None:
+            try:
+                old_lease = json.loads(old_lease_json)
+                if old_lease['expires_at'] > now:
+                    current = current + old_used
+                    if current > limit:
+                        current = limit
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        allocated = 0
+        for inst_id, lease_json in leases.items():
+            try:
+                lease = json.loads(lease_json)
+                if inst_id != instance_id and lease['expires_at'] > now:
+                    allocated += (lease['quota'] - lease['used'])
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        remaining = limit - current - allocated
+        granted = min(request_amount, max(0, remaining))
+
+        if granted > 0:
+            lease = {
+                'instance_id': instance_id,
+                'quota': granted,
+                'used': 0,
+                'expires_at': now + lease_ttl,
+                'acquired_at': now
+            }
+            leases[instance_id] = json.dumps(lease)
+            self._data[leases_key] = (leases, time.time() + window_ttl)
+            self._data[key] = (current, time.time() + window_ttl)
+            return StorageResult(success=True, value=[granted, limit - current - allocated - granted])
+
+        self._data[key] = (current, time.time() + window_ttl)
+        return StorageResult(success=True, value=[0, remaining])
+
+    def _eval_return_lease(self, keys: list, args: list) -> StorageResult:
+        import json
+
+        leases_key = keys[0]
+        instance_id = args[0]
+        used = int(args[1])
+        now = float(args[2])
+
+        leases, _ = self._data.get(leases_key, ({}, None))
+        if not isinstance(leases, dict):
+            leases = {}
+
+        lease_json = leases.get(instance_id)
+        if lease_json is None:
+            return StorageResult(success=True, value=[0, 0])
+
+        try:
+            lease = json.loads(lease_json)
+            returned = lease['quota'] - used
+            lease['used'] = used
+            lease['expires_at'] = now
+            leases[instance_id] = json.dumps(lease)
+            self._data[leases_key] = (leases, time.time() + 60)
+            return StorageResult(success=True, value=[returned, used])
+        except (json.JSONDecodeError, KeyError):
+            return StorageResult(success=True, value=[0, 0])
+
+    def _eval_window_sync(self, keys: list, args: list) -> StorageResult:
+        import json
+
+        key = keys[0]
+        leases_key = keys[1]
+        limit = int(args[0])
+        window_ttl = float(args[1])
+        local_count = int(args[2])
+        now = float(args[3])
+
+        current, _ = self._data.get(key, (0, None))
+        if not isinstance(current, int):
+            current = 0
+
+        new_global = current + local_count
+        if new_global > limit:
+            new_global = limit
+
+        self._data[key] = (new_global, time.time() + window_ttl)
+
+        leases, _ = self._data.get(leases_key, ({}, None))
+        if not isinstance(leases, dict):
+            leases = {}
+
+        active_allocated = 0
+        for inst_id, lease_json in leases.items():
+            try:
+                lease = json.loads(lease_json)
+                if lease['expires_at'] > now:
+                    active_allocated += (lease['quota'] - lease['used'])
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        return StorageResult(success=True, value=[new_global, limit - new_global - active_allocated])
 
     def is_available(self) -> bool:
         return self._available

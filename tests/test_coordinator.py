@@ -1,4 +1,5 @@
 import time
+import asyncio
 import pytest
 from rate_limiter.coordinator import (
     DistributedCoordinator,
