@@ -36,6 +36,7 @@ class WindowState:
     window_start: float
     global_count: int
     local_count: int
+    synced_count: int
     last_sync_time: float
 
 
@@ -44,6 +45,7 @@ class DistributedCoordinator:
     -- SCRIPT_TAG: PREFETCH_SCRIPT
     local key = KEYS[1]
     local leases_key = KEYS[2]
+    local prev_key = KEYS[3]
     local limit = tonumber(ARGV[1])
     local request_amount = tonumber(ARGV[2])
     local instance_id = ARGV[3]
@@ -51,6 +53,7 @@ class DistributedCoordinator:
     local window_ttl = tonumber(ARGV[5])
     local now = tonumber(ARGV[6])
     local old_used = tonumber(ARGV[7])
+    local window_size = tonumber(ARGV[8])
 
     local current = redis.call('GET', key)
     if current == false then
@@ -63,12 +66,25 @@ class DistributedCoordinator:
     if old_lease_json ~= false then
         local old_lease = cjson.decode(old_lease_json)
         if old_lease.expires_at > now then
-            current = current + old_used
             if current > limit then
                 current = limit
             end
         end
     end
+
+    local prev_window_weight = 0
+    local prev_used = 0
+    local window_start = math.floor(now / window_size) * window_size
+    local time_in_window = now - window_start
+    if time_in_window < window_size then
+        prev_window_weight = (window_size - time_in_window) / window_size
+        local prev_count = redis.call('GET', prev_key)
+        if prev_count ~= false then
+            prev_used = tonumber(prev_count)
+        end
+    end
+
+    local sliding_used = prev_used * prev_window_weight + current
 
     local allocated = 0
     local leases = redis.call('HGETALL', leases_key)
@@ -80,8 +96,13 @@ class DistributedCoordinator:
         end
     end
 
-    local remaining = limit - current - allocated
-    local granted = math.min(request_amount, math.max(0, remaining))
+    local effective_used = sliding_used + allocated
+    local remaining = limit - effective_used
+    if remaining < 0 then
+        remaining = 0
+    end
+
+    local granted = math.min(request_amount, math.floor(remaining))
 
     if granted > 0 then
         local lease = {
@@ -97,12 +118,12 @@ class DistributedCoordinator:
         redis.call('SET', key, current)
         redis.call('EXPIRE', key, window_ttl)
 
-        return {granted, limit - current - allocated - granted, current}
+        return {granted, math.floor(remaining - granted), current}
     end
 
     redis.call('SET', key, current)
     redis.call('EXPIRE', key, window_ttl)
-    return {0, remaining, current}
+    return {0, math.floor(remaining), current}
     """
 
     RETURN_LEASE_SCRIPT = """
@@ -134,6 +155,7 @@ class DistributedCoordinator:
     local window_ttl = tonumber(ARGV[2])
     local local_count = tonumber(ARGV[3])
     local now = tonumber(ARGV[4])
+    local instance_id = ARGV[5]
 
     local current = redis.call('GET', key)
     if current == false then
@@ -149,6 +171,21 @@ class DistributedCoordinator:
 
     redis.call('SET', key, new_global)
     redis.call('EXPIRE', key, window_ttl)
+
+    if instance_id ~= '' then
+        local lease_json = redis.call('HGET', leases_key, instance_id)
+        if lease_json ~= false then
+            local lease = cjson.decode(lease_json)
+            if lease.expires_at > now then
+                lease.used = lease.used + local_count
+                if lease.used > lease.quota then
+                    lease.used = lease.quota
+                end
+                redis.call('HSET', leases_key, instance_id, cjson.encode(lease))
+                redis.call('EXPIRE', leases_key, window_ttl)
+            end
+        end
+    end
 
     local leases = redis.call('HGETALL', leases_key)
     local active_allocated = 0
@@ -267,6 +304,7 @@ class DistributedCoordinator:
             window_start=self._get_window_start(time.time()),
             global_count=0,
             local_count=0,
+            synced_count=0,
             last_sync_time=0
         )
 
@@ -321,6 +359,7 @@ class DistributedCoordinator:
                 window_start=current_window_start,
                 global_count=0,
                 local_count=0,
+                synced_count=0,
                 last_sync_time=0
             )
             self._current_lease = None
@@ -353,16 +392,18 @@ class DistributedCoordinator:
                 pass
 
     def _prefetch_quota(self, now: float) -> Tuple[int, int]:
+        old_used = self._window_state.local_count
         self._force_sync(now)
 
         window_start = self._get_window_start(now)
         key = self._get_counter_key(window_start)
         leases_key = self._get_leases_key(window_start)
+        prev_key = self._get_counter_key(window_start - self.window_size)
         request_amount = self._calculate_prefetch_amount()
 
         result = self.storage.eval(
             self.PREFETCH_SCRIPT,
-            [key, leases_key],
+            [key, leases_key, prev_key],
             [
                 str(self.global_limit),
                 str(request_amount),
@@ -370,7 +411,8 @@ class DistributedCoordinator:
                 str(int(self.lease_ttl)),
                 str(int(self.window_size * 2)),
                 str(int(now)),
-                "0"
+                str(old_used),
+                str(self.window_size)
             ]
         )
 
@@ -384,8 +426,6 @@ class DistributedCoordinator:
         self._window_state.global_count = global_count
         if granted > 0:
             self._window_state.local_count = 0
-            if self._current_lease is not None:
-                self._current_lease.used = 0
 
         if granted > 0:
             self._current_lease = PrefetchLease(
@@ -400,6 +440,7 @@ class DistributedCoordinator:
         return granted, remaining
 
     async def _aprefetch_quota(self, now: float) -> Tuple[int, int]:
+        old_used = self._window_state.local_count
         try:
             self._force_sync(now)
         except Exception:
@@ -408,11 +449,12 @@ class DistributedCoordinator:
         window_start = self._get_window_start(now)
         key = self._get_counter_key(window_start)
         leases_key = self._get_leases_key(window_start)
+        prev_key = self._get_counter_key(window_start - self.window_size)
         request_amount = self._calculate_prefetch_amount()
 
         result = await self.storage.aeval(
             self.PREFETCH_SCRIPT,
-            [key, leases_key],
+            [key, leases_key, prev_key],
             [
                 str(self.global_limit),
                 str(request_amount),
@@ -420,7 +462,8 @@ class DistributedCoordinator:
                 str(int(self.lease_ttl)),
                 str(int(self.window_size * 2)),
                 str(int(now)),
-                "0"
+                str(old_used),
+                str(self.window_size)
             ]
         )
 
@@ -434,8 +477,6 @@ class DistributedCoordinator:
         self._window_state.global_count = global_count
         if granted > 0:
             self._window_state.local_count = 0
-            if self._current_lease is not None:
-                self._current_lease.used = 0
 
         if granted > 0:
             self._current_lease = PrefetchLease(
@@ -505,17 +546,15 @@ class DistributedCoordinator:
                     str(self.global_limit),
                     str(int(self.window_size * 2)),
                     str(self._window_state.local_count),
-                    str(int(now))
+                    str(int(now)),
+                    self.instance_id
                 ]
             )
 
             if result.success and result.value:
-                global_count, available = result.value
+                global_count, _ = result.value
+                self._window_state.synced_count += self._window_state.local_count
                 self._window_state.global_count = int(global_count)
-                if self._current_lease is not None:
-                    self._current_lease.used = max(
-                        0, self._current_lease.used - self._window_state.local_count
-                    )
                 self._window_state.local_count = 0
                 self._window_state.last_sync_time = now
         except Exception:
@@ -539,17 +578,15 @@ class DistributedCoordinator:
                     str(self.global_limit),
                     str(int(self.window_size * 2)),
                     str(self._window_state.local_count),
-                    str(int(now))
+                    str(int(now)),
+                    self.instance_id
                 ]
             )
 
             if result.success and result.value:
-                global_count, available = result.value
+                global_count, _ = result.value
+                self._window_state.synced_count += self._window_state.local_count
                 self._window_state.global_count = int(global_count)
-                if self._current_lease is not None:
-                    self._current_lease.used = max(
-                        0, self._current_lease.used - self._window_state.local_count
-                    )
                 self._window_state.local_count = 0
                 self._window_state.last_sync_time = now
         except Exception:
@@ -960,39 +997,41 @@ class DistributedCoordinator:
                     str(self.global_limit),
                     str(int(self.window_size * 2)),
                     str(self._window_state.local_count),
-                    str(int(now))
+                    str(int(now)),
+                    self.instance_id
                 ]
             )
             if result.success and result.value:
                 global_count, _ = result.value
+                self._window_state.synced_count += self._window_state.local_count
                 self._window_state.global_count = int(global_count)
-                if self._current_lease is not None:
-                    self._current_lease.used = max(
-                        0, self._current_lease.used - self._window_state.local_count
-                    )
                 self._window_state.local_count = 0
                 self._window_state.last_sync_time = now
         except Exception:
             pass
 
-    def get_stats(self) -> Dict:
+    def get_stats(self, force_sync: bool = False) -> Dict:
         with self._lock:
             now = time.time()
-            try:
-                self._force_sync(now)
-            except Exception:
-                pass
+            if force_sync:
+                try:
+                    self._force_sync(now)
+                except Exception:
+                    pass
 
-            actual_global_used = self._window_state.global_count + self._window_state.local_count
             lease_used = self._current_lease.used if self._current_lease else 0
             lease_quota = self._current_lease.quota if self._current_lease else 0
 
+            synced_to_center = self._window_state.synced_count
+            pending_sync = self._window_state.local_count
+            local_used_total = synced_to_center + pending_sync
+
             if self.mode == CoordinationMode.PRE_FETCH:
-                effective_used = actual_global_used
-                remaining = max(0, self.global_limit - effective_used)
+                global_used = self._window_state.global_count
             else:
-                effective_used = actual_global_used
-                remaining = max(0, self.global_limit - effective_used)
+                global_used = self._window_state.global_count
+
+            remaining = max(0, self.global_limit - global_used)
 
             return {
                 "instance_id": self.instance_id,
@@ -1002,7 +1041,10 @@ class DistributedCoordinator:
                 "degraded": self._degraded,
                 "degradation_mode": self.degradation_mode.value,
                 "current_window_start": self._window_state.window_start,
-                "global_count": effective_used,
+                "global_count": global_used,
+                "local_used_total": local_used_total,
+                "synced_to_center": synced_to_center,
+                "pending_sync": pending_sync,
                 "local_count": lease_used,
                 "local_tokens": self._local_bucket.peek(),
                 "has_lease": self._current_lease is not None,

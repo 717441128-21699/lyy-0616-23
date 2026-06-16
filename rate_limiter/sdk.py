@@ -212,8 +212,8 @@ class AsyncRateLimiterClient:
         except QuotaExceededError:
             return False
 
-    def get_stats(self) -> Dict[str, Any]:
-        return self.coordinator.get_stats()
+    def get_stats(self, force_sync: bool = False) -> Dict[str, Any]:
+        return self.coordinator.get_stats(force_sync=force_sync)
 
     def is_degraded(self) -> bool:
         return self.coordinator._degraded

@@ -203,6 +203,7 @@ class InMemoryStorage(BaseStorage):
 
         key = keys[0]
         leases_key = keys[1]
+        prev_key = keys[2] if len(keys) > 2 else None
         limit = int(args[0])
         request_amount = int(args[1])
         instance_id = args[2]
@@ -210,6 +211,7 @@ class InMemoryStorage(BaseStorage):
         window_ttl = float(args[4])
         now = float(args[5])
         old_used = int(args[6]) if len(args) > 6 else 0
+        window_size = float(args[7]) if len(args) > 7 else 1.0
 
         current, _ = self._data.get(key, (0, None))
         if not isinstance(current, int):
@@ -224,11 +226,22 @@ class InMemoryStorage(BaseStorage):
             try:
                 old_lease = json.loads(old_lease_json)
                 if old_lease['expires_at'] > now:
-                    current = current + old_used
                     if current > limit:
                         current = limit
             except (json.JSONDecodeError, KeyError):
                 pass
+
+        prev_used = 0
+        prev_window_weight = 0
+        window_start = int(now / window_size) * window_size
+        time_in_window = now - window_start
+        if prev_key is not None and time_in_window < window_size:
+            prev_window_weight = (window_size - time_in_window) / window_size
+            prev_count, _ = self._data.get(prev_key, (0, None))
+            if isinstance(prev_count, (int, float)):
+                prev_used = float(prev_count)
+
+        sliding_used = prev_used * prev_window_weight + current
 
         allocated = 0
         for inst_id, lease_json in leases.items():
@@ -239,8 +252,9 @@ class InMemoryStorage(BaseStorage):
             except (json.JSONDecodeError, KeyError):
                 pass
 
-        remaining = limit - current - allocated
-        granted = min(request_amount, max(0, remaining))
+        effective_used = sliding_used + allocated
+        remaining = max(0, limit - effective_used)
+        granted = min(request_amount, int(remaining))
 
         if granted > 0:
             lease = {
@@ -253,10 +267,10 @@ class InMemoryStorage(BaseStorage):
             leases[instance_id] = json.dumps(lease)
             self._data[leases_key] = (leases, time.time() + window_ttl)
             self._data[key] = (current, time.time() + window_ttl)
-            return StorageResult(success=True, value=[granted, limit - current - allocated - granted, current])
+            return StorageResult(success=True, value=[granted, int(max(0, remaining - granted)), current])
 
         self._data[key] = (current, time.time() + window_ttl)
-        return StorageResult(success=True, value=[0, remaining, current])
+        return StorageResult(success=True, value=[0, int(remaining), current])
 
     def _eval_return_lease(self, keys: list, args: list) -> StorageResult:
         import json
@@ -294,6 +308,7 @@ class InMemoryStorage(BaseStorage):
         window_ttl = float(args[1])
         local_count = int(args[2])
         now = float(args[3])
+        instance_id = args[4] if len(args) > 4 else ''
 
         current, _ = self._data.get(key, (0, None))
         if not isinstance(current, int):
@@ -304,6 +319,18 @@ class InMemoryStorage(BaseStorage):
             new_global = limit
 
         self._data[key] = (new_global, time.time() + window_ttl)
+
+        if instance_id:
+            leases, _ = self._data.get(leases_key, ({}, None))
+            if isinstance(leases, dict) and instance_id in leases:
+                try:
+                    lease = json.loads(leases[instance_id])
+                    if lease['expires_at'] > now:
+                        lease['used'] = min(lease['quota'], lease['used'] + local_count)
+                        leases[instance_id] = json.dumps(lease)
+                        self._data[leases_key] = (leases, time.time() + window_ttl)
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
         leases, _ = self._data.get(leases_key, ({}, None))
         if not isinstance(leases, dict):

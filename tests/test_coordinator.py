@@ -60,7 +60,8 @@ class TestDistributedCoordinator:
         stats = coordinator.get_stats()
         assert stats["has_lease"] is True
         assert stats["lease_quota"] >= 5
-        assert stats["global_count"] >= 50
+        assert stats["local_used_total"] >= 50
+        assert stats["pending_sync"] + stats["synced_to_center"] >= 50
         assert "remaining" in stats
         assert stats["remaining"] >= 0
 
@@ -359,7 +360,9 @@ class TestDistributedCoordinator:
             storage=storage,
             global_limit=1000,
             window_size=1.0,
-            mode=CoordinationMode.PER_REQUEST
+            mode=CoordinationMode.PRE_FETCH,
+            min_prefetch=50,
+            max_prefetch=100
         )
 
         results = []
@@ -376,4 +379,229 @@ class TestDistributedCoordinator:
             t.join()
 
         success_count = sum(1 for r in results if r)
-        assert 990 <= success_count <= 1010
+        assert 950 <= success_count <= 1050
+
+    def test_prefetch_dual_instance_global_limit(self):
+        import threading
+        storage = InMemoryStorage()
+        limit = 10
+
+        coord_a = DistributedCoordinator(
+            storage=storage,
+            global_limit=limit,
+            window_size=1.0,
+            mode=CoordinationMode.PRE_FETCH,
+            min_prefetch=3,
+            max_prefetch=5,
+            instance_id="instance_a"
+        )
+
+        coord_b = DistributedCoordinator(
+            storage=storage,
+            global_limit=limit,
+            window_size=1.0,
+            mode=CoordinationMode.PRE_FETCH,
+            min_prefetch=3,
+            max_prefetch=5,
+            instance_id="instance_b"
+        )
+
+        timeline_a = []
+        timeline_b = []
+
+        def client_loop(coord, timeline, duration):
+            start = time.time()
+            while time.time() - start < duration:
+                try:
+                    result = coord.try_acquire(1)
+                    if result.allowed:
+                        timeline.append(time.time())
+                except Exception:
+                    pass
+                time.sleep(0.005)
+
+        t1 = threading.Thread(target=client_loop, args=(coord_a, timeline_a, 2.0))
+        t2 = threading.Thread(target=client_loop, args=(coord_b, timeline_b, 2.0))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        all_events = sorted(timeline_a + timeline_b)
+        total = len(all_events)
+
+        assert total >= limit and total <= limit * 2 + 2, \
+            f"Total {total} not in [{limit}, {limit * 2 + 2}]"
+
+        window_log = []
+        max_in_window = 0
+        for t in all_events:
+            cutoff = t - 1.0
+            while window_log and window_log[0] < cutoff:
+                window_log.pop(0)
+            window_log.append(t)
+            max_in_window = max(max_in_window, len(window_log))
+
+        assert max_in_window <= limit + 1, \
+            f"Max in 1s window {max_in_window} > {limit + 1}"
+
+        test_duration = 2.0
+        rate = total / test_duration
+        assert rate <= limit * 1.25, \
+            f"Rate {rate:.1f}/s > {limit * 1.25:.1f}/s"
+
+    def test_prefetch_stats_hierarchy(self):
+        storage = InMemoryStorage()
+        limit = 50
+        requests = 30
+
+        coord = DistributedCoordinator(
+            storage=storage,
+            global_limit=limit,
+            window_size=1.0,
+            mode=CoordinationMode.PRE_FETCH,
+            min_prefetch=10,
+            max_prefetch=10,
+            instance_id="test_stats",
+            sync_interval=60.0
+        )
+
+        actual_passed = 0
+        for _ in range(requests + 5):
+            result = coord.try_acquire(1)
+            if result.allowed:
+                actual_passed += 1
+
+        s1 = coord.get_stats(force_sync=False)
+
+        assert s1["local_used_total"] == actual_passed, \
+            f"local_used_total={s1['local_used_total']} != {actual_passed}"
+        assert s1["pending_sync"] + s1["synced_to_center"] == actual_passed, \
+            f"pending + synced != actual"
+        assert "remaining" in s1
+        assert s1["remaining"] >= 0
+
+        for _ in range(3):
+            s = coord.get_stats(force_sync=False)
+            assert s["local_used_total"] == actual_passed
+
+        s2 = coord.get_stats(force_sync=True)
+        assert s2["pending_sync"] == 0, \
+            f"pending_sync after force sync = {s2['pending_sync']} != 0"
+        assert s2["local_used_total"] == actual_passed, \
+            f"local_used_total should not reset after sync"
+        assert s2["synced_to_center"] == actual_passed, \
+            f"synced_to_center={s2['synced_to_center']} != {actual_passed}"
+        assert s2["remaining"] == max(0, limit - s2["global_count"])
+
+    def test_prefetch_sliding_window_boundary(self):
+        storage = InMemoryStorage()
+        limit = 10
+
+        coord = DistributedCoordinator(
+            storage=storage,
+            global_limit=limit,
+            window_size=1.0,
+            mode=CoordinationMode.PRE_FETCH,
+            min_prefetch=5,
+            max_prefetch=5,
+            instance_id="test_boundary",
+            sync_interval=0.0
+        )
+
+        phase1_passed = 0
+        for _ in range(limit):
+            result = coord.try_acquire(1)
+            if result.allowed:
+                phase1_passed += 1
+
+        assert phase1_passed == limit
+
+        time.sleep(1.1)
+
+        timeline = []
+        start = time.time()
+        while time.time() - start < 1.5:
+            result = coord.try_acquire(1)
+            if result.allowed:
+                timeline.append(time.time())
+            time.sleep(0.01)
+
+        window_log = []
+        max_in_window = 0
+        for t in timeline:
+            cutoff = t - 1.0
+            while window_log and window_log[0] < cutoff:
+                window_log.pop(0)
+            window_log.append(t)
+            max_in_window = max(max_in_window, len(window_log))
+
+        assert max_in_window <= limit + 1, \
+            f"Sliding window burst {max_in_window} > {limit + 1}"
+
+    @pytest.mark.asyncio
+    async def test_async_prefetch_mode(self):
+        storage = InMemoryStorage()
+        limit = 20
+
+        coord = DistributedCoordinator(
+            storage=storage,
+            global_limit=limit,
+            window_size=1.0,
+            mode=CoordinationMode.PRE_FETCH,
+            min_prefetch=5,
+            max_prefetch=10,
+            instance_id="test_async"
+        )
+
+        passed = 0
+        for _ in range(30):
+            result = await coord.atry_acquire(1)
+            if result.allowed:
+                passed += 1
+
+        assert passed <= limit + 1, f"Async passed {passed} > {limit + 1}"
+
+        stats = coord.get_stats()
+        assert stats["local_used_total"] == passed
+        assert "remaining" in stats
+        assert stats["remaining"] >= 0
+
+    @pytest.mark.asyncio
+    async def test_async_prefetch_dual_instance(self):
+        storage = InMemoryStorage()
+        limit = 10
+
+        coord_a = DistributedCoordinator(
+            storage=storage,
+            global_limit=limit,
+            window_size=1.0,
+            mode=CoordinationMode.PRE_FETCH,
+            min_prefetch=3,
+            max_prefetch=5,
+            instance_id="async_a"
+        )
+
+        coord_b = DistributedCoordinator(
+            storage=storage,
+            global_limit=limit,
+            window_size=1.0,
+            mode=CoordinationMode.PRE_FETCH,
+            min_prefetch=3,
+            max_prefetch=5,
+            instance_id="async_b"
+        )
+
+        passed_a = 0
+        passed_b = 0
+
+        for _ in range(20):
+            if (await coord_a.atry_acquire(1)).allowed:
+                passed_a += 1
+            if (await coord_b.atry_acquire(1)).allowed:
+                passed_b += 1
+
+        total = passed_a + passed_b
+        assert total <= limit * 2, f"Total {total} > {limit * 2}"
+        assert total <= limit + 2 or total <= limit * 1.5, \
+            f"Total {total} too high for limit {limit}"
